@@ -3,6 +3,10 @@ package storage
 import (
 	"context"
 	"fmt"
+	keyvault "github.com/hashicorp/terraform-provider-azurerm/internal/services/keyvault/client"
+	keyVaultParse "github.com/hashicorp/terraform-provider-azurerm/internal/services/keyvault/parse"
+	keyVaultValidate "github.com/hashicorp/terraform-provider-azurerm/internal/services/keyvault/validate"
+	resource "github.com/hashicorp/terraform-provider-azurerm/internal/services/resource/client"
 	"log"
 	"net/http"
 	"strings"
@@ -218,6 +222,27 @@ func resourceStorageAccount() *pluginsdk.Resource {
 							Type:     pluginsdk.TypeBool,
 							Optional: true,
 							Default:  false,
+						},
+					},
+				},
+			},
+
+			"customer_managed_key": {
+				Type: pluginsdk.TypeList,
+				Optional: true,
+				MaxItems: 1,
+				Elem: &pluginsdk.Resource{
+					Schema: map[string]*pluginsdk.Schema{
+						"key_vault_key_id": {
+							Type:         pluginsdk.TypeString,
+							Required:     true,
+							ValidateFunc: keyVaultValidate.KeyVaultChildID,
+						},
+
+						"user_assigned_identity_id": {
+							Type:         pluginsdk.TypeString,
+							Required:     true,
+							ValidateFunc: msiValidate.UserAssignedIdentityID,
 						},
 					},
 				},
@@ -938,6 +963,8 @@ func resourceStorageAccountCreate(d *pluginsdk.ResourceData, meta interface{}) e
 	tenantId := meta.(*clients.Client).Account.TenantId
 	client := meta.(*clients.Client).Storage.AccountsClient
 	storageClient := meta.(*clients.Client).Storage
+	keyVaultClient := meta.(*clients.Client).KeyVault
+	resourceClient := meta.(*clients.Client).Resource
 	subscriptionId := meta.(*clients.Client).Account.SubscriptionId
 	ctx, cancel := timeouts.ForCreate(meta.(*clients.Client).StopContext, d)
 	defer cancel()
@@ -1069,6 +1096,16 @@ func resourceStorageAccountCreate(d *pluginsdk.ResourceData, meta interface{}) e
 	if v, ok := d.GetOk("routing"); ok {
 		parameters.RoutingPreference = expandArmStorageAccountRouting(v.([]interface{}))
 	}
+
+	// TODO
+	var encryption *storage.Encryption
+	if v, ok := d.GetOk("customer_managed_key"); ok {
+		encryption, err = expandCustomerManagedKey(ctx, keyVaultClient, resourceClient, v.([]interface{}))
+		if err != nil {
+			return err
+		}
+	}
+	parameters.Encryption = encryption
 
 	// By default (by leaving empty), the table and queue encryption key type is set to "Service". While users can change it to "Account" so that
 	// they can further use CMK to encrypt table/queue data. Only the StorageV2 account kind supports the Account key type.
@@ -1765,6 +1802,31 @@ func resourceStorageAccountRead(d *pluginsdk.ResourceData, meta interface{}) err
 		}
 		d.Set("table_encryption_key_type", tableEncryptionKeyType)
 		d.Set("queue_encryption_key_type", queueEncryptionKeyType)
+
+		// TODO
+		if encryption := props.Encryption; encryption.KeyVaultProperties != nil && encryption.Services != nil {
+			keyName := ""
+			keyVaultURI := ""
+			keyVersion := ""
+			if keyVaultProps := encryption.KeyVaultProperties; props != nil {
+				if keyVaultProps.KeyName != nil {
+					keyName = *keyVaultProps.KeyName
+				}
+				if keyVaultProps.KeyVaultURI != nil {
+					keyVaultURI = *keyVaultProps.KeyVaultURI
+				}
+				if keyVaultProps.KeyVersion != nil {
+					keyVersion = *keyVaultProps.KeyVersion
+				}
+			}
+
+			if keyVaultURI != "" {
+				key, err := keyVaultParse.NewNestedItemID(keyVaultURI, "keys", keyName, keyVersion)
+				if err != nil {
+					d.Set("key_vault_key_id", key.ID())
+				}
+			}
+		}
 	}
 
 	if accessKeys := keys.Keys; accessKeys != nil {
@@ -1970,6 +2032,48 @@ func flattenStorageAccountCustomDomain(input *storage.CustomDomain) []interface{
 
 	// use_subdomain isn't returned
 	return []interface{}{domain}
+}
+
+func expandCustomerManagedKey(ctx context.Context, keyVaultClient *keyvault.Client, resourceClient *resource.Client, input []interface{}) (*storage.Encryption, error) {
+	if len(input) == 0 {
+		return &storage.Encryption{}, nil
+	}
+
+	v := input[0].(map[string]interface{})
+
+	key, err := keyVaultParse.ParseNestedItemID(v["key_vault_key_id"].(string))
+	if err != nil {
+		return nil, err
+	}
+
+	keyVaultIdRaw, err := keyVaultClient.KeyVaultIDFromBaseUrl(ctx, resourceClient, key.KeyVaultBaseUrl)
+	if err != nil || keyVaultIdRaw == nil {
+		return nil, fmt.Errorf("retrieving Resource ID for Key Vault at URL %s: %+v", key.KeyVaultBaseUrl, err)
+	}
+
+	encryption := &storage.Encryption{
+		Services: &storage.EncryptionServices{
+			Blob: &storage.EncryptionService{
+				Enabled: utils.Bool(true),
+				KeyType: storage.KeyTypeAccount,
+			},
+			File: &storage.EncryptionService{
+				Enabled: utils.Bool(true),
+				KeyType: storage.KeyTypeAccount,
+			},
+		},
+		EncryptionIdentity: &storage.EncryptionIdentity{
+			EncryptionUserAssignedIdentity: utils.String(v["user_assigned_identity_id"].(string)),
+		},
+		KeySource: storage.KeySourceMicrosoftKeyvault,
+		KeyVaultProperties: &storage.KeyVaultProperties{
+			KeyName:     utils.String(key.Name),
+			KeyVersion:  utils.String(key.Version),
+			KeyVaultURI: utils.String(key.KeyVaultBaseUrl),
+		},
+	}
+
+	return encryption, nil
 }
 
 func expandArmStorageAccountAzureFilesAuthentication(input []interface{}) (*storage.AzureFilesIdentityBasedAuthentication, error) {
